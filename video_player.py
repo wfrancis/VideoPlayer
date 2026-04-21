@@ -918,12 +918,12 @@ class Player(QMainWindow):
 
         self.back_btn = QPushButton()
         self.back_btn.setObjectName("controlButton")
-        self.back_btn.clicked.connect(lambda: self.skip(-self.skip_seconds * 1000))
+        self.back_btn.clicked.connect(lambda: self.skip(-self._skip_interval_ms()))
         controls_row.addWidget(self.back_btn)
 
         self.fwd_btn = QPushButton()
         self.fwd_btn.setObjectName("controlButton")
-        self.fwd_btn.clicked.connect(lambda: self.skip(self.skip_seconds * 1000))
+        self.fwd_btn.clicked.connect(lambda: self.skip(self._skip_interval_ms()))
         controls_row.addWidget(self.fwd_btn)
 
         self.skip_combo = QComboBox()
@@ -937,6 +937,7 @@ class Player(QMainWindow):
         self.skip_combo.setCurrentIndex(index)
         self.skip_combo.setToolTip("Skip interval")
         self.skip_combo.currentIndexChanged.connect(self._on_skip_changed)
+        self._on_skip_changed(self.skip_combo.currentIndex())
         controls_row.addWidget(self.skip_combo)
 
         self.mute_btn = QPushButton("Mute")
@@ -1152,8 +1153,8 @@ class Player(QMainWindow):
                 self._shortcuts.append(shortcut)
 
         bind(["Space", "K"], self.toggle_play)
-        bind(["Left", "J"], lambda: self.skip(-KEYBOARD_SKIP_MS))
-        bind(["Right", "L"], lambda: self.skip(KEYBOARD_SKIP_MS))
+        bind(["Left", "J"], lambda: self.skip(-self._skip_interval_ms()))
+        bind(["Right", "L"], lambda: self.skip(self._skip_interval_ms()))
         bind("Shift+Left", lambda: self.skip(-KEYBOARD_MEDIUM_SKIP_MS))
         bind("Shift+Right", lambda: self.skip(KEYBOARD_MEDIUM_SKIP_MS))
         bind("Alt+Left", lambda: self.skip(-KEYBOARD_LARGE_SKIP_MS))
@@ -1277,15 +1278,28 @@ class Player(QMainWindow):
         else:
             self.player.play()
 
-    def skip(self, ms):
+    def skip(self, ms, *, show_osd=False):
         duration = self.player.duration()
         new_position = max(0, min(duration, self.player.position() + ms))
         self.player.setPosition(new_position)
-        direction = "+" if ms >= 0 else ""
-        self.show_osd(f"{direction}{ms / 1000:.0f}s")
+
+        if show_osd:
+            direction = "+" if ms >= 0 else ""
+            self.show_osd(f"{direction}{ms / 1000:.0f}s")
+
+    def _skip_interval_ms(self):
+        current = self.skip_combo.currentData() if hasattr(self, "skip_combo") else None
+        try:
+            seconds = int(current)
+        except (TypeError, ValueError):
+            seconds = int(self.skip_seconds)
+        return seconds * 1000
 
     def _on_skip_changed(self, _index):
-        self.skip_seconds = int(self.skip_combo.currentData())
+        current = self.skip_combo.currentData()
+        if current is None:
+            return
+        self.skip_seconds = int(current)
         self.settings.setValue("skip_seconds", self.skip_seconds)
         self._refresh_skip_labels()
         self._update_state(skip_seconds=self.skip_seconds)
@@ -1552,7 +1566,7 @@ class Player(QMainWindow):
         index = VIEW_MODES.index(self.view_mode)
         self.set_view_mode(VIEW_MODES[(index + direction) % len(VIEW_MODES)])
 
-    def zoom_by(self, factor, absolute=False):
+    def zoom_by(self, factor, absolute=False, show_osd=False):
         if absolute:
             self.user_zoom = clamp(float(factor), 1.0, 8.0)
         else:
@@ -1560,14 +1574,16 @@ class Player(QMainWindow):
         self._apply_view_transform()
         self._sync_zoom_ui()
         self._update_state(zoom=round(self.user_zoom, 3))
-        self.show_osd(f"Zoom {self.user_zoom:.2f}x")
+        if show_osd:
+            self.show_osd(f"Zoom {self.user_zoom:.2f}x")
 
-    def reset_zoom(self):
+    def reset_zoom(self, show_osd=False):
         self.user_zoom = 1.0
         self._apply_view_transform()
         self._sync_zoom_ui()
         self._update_state(zoom=self.user_zoom)
-        self.show_osd("Zoom reset")
+        if show_osd:
+            self.show_osd("Zoom reset")
 
     def _sync_zoom_ui(self):
         percent = int(round(self.user_zoom * 100))
