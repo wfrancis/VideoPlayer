@@ -1,0 +1,15 @@
+APP_NAME = "Video Player"
+APP_DISPLAY_NAME = "Video Player"
+APP_IDENTIFIER = "local.videoplayer"
+APP_ORGANIZATION_NAME = "Video Player"
+APP_ORGANIZATION_DOMAIN = "videoplayer.local"
+APP_SETTINGS_ORG = APP_IDENTIFIER
+APP_SETTINGS_APP = "Video Player"
+LEGACY_SETTINGS_ORG = "local.william"
+LEGACY_SETTINGS_APP = "VideoPlayer"
+APP_VERSION = "1.1.0"
+APP_BUILD = "11"
+APP_CATEGORY = "public.app-category.video"
+APP_MIN_SYSTEM_VERSION = "11.0"
+DEFAULT_CONTROL_HOST = "127.0.0.1"
+DEFAULT_CONTROL_PORT = 9876
