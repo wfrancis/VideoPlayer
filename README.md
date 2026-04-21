@@ -4,9 +4,9 @@
 [![Release](https://img.shields.io/github/v/release/wfrancis/VideoPlayer)](https://github.com/wfrancis/VideoPlayer/releases)
 [![License](https://img.shields.io/github/license/wfrancis/VideoPlayer)](LICENSE)
 
-An open source macOS video player built with PyQt6.
+QuickTime is too limited. VLC is too bloated. Most free `.mp4` players still miss the basic features people actually want.
 
-It is designed to feel faster and cleaner than the usual free `.mp4` players, with the features people actually miss every day: smooth scrubbing, quick skips, crop and zoom controls, subtitle timing, playback memory, fullscreen, and a scriptable local control API.
+Video Player is an open source macOS player built around the stuff that actually matters in daily use: smooth scrubbing, real skip controls, zoom and crop modes, subtitle timing, playback memory, fullscreen, mini-player mode, and a scriptable local control API.
 
 <img src="assets/icon.png" alt="Video Player icon" width="180">
 
