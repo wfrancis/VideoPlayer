@@ -13,6 +13,7 @@ from pathlib import Path
 from PyQt6.QtCore import (
     QEasingCurve,
     QEvent,
+    QPointF,
     QPropertyAnimation,
     QSettings,
     QSignalBlocker,
@@ -1571,7 +1572,7 @@ class Player(QMainWindow):
             self.user_zoom = clamp(float(factor), 1.0, 8.0)
         else:
             self.user_zoom = clamp(self.user_zoom * float(factor), 1.0, 8.0)
-        self._apply_view_transform()
+        self._apply_view_transform(preserve_center=True)
         self._sync_zoom_ui()
         self._update_state(zoom=round(self.user_zoom, 3))
         if show_osd:
@@ -1579,7 +1580,7 @@ class Player(QMainWindow):
 
     def reset_zoom(self, show_osd=False):
         self.user_zoom = 1.0
-        self._apply_view_transform()
+        self._apply_view_transform(preserve_center=True)
         self._sync_zoom_ui()
         self._update_state(zoom=self.user_zoom)
         if show_osd:
@@ -1596,10 +1597,15 @@ class Player(QMainWindow):
     def _fit_video(self, _size):
         self._apply_view_transform()
 
-    def _apply_view_transform(self):
+    def _apply_view_transform(self, preserve_center=False):
         size = self.video_item.nativeSize()
         if not size.isValid() or size.width() <= 0 or size.height() <= 0:
             return
+
+        scene_center = None
+        if preserve_center and self.scene.sceneRect().isValid():
+            viewport_center = self.view.viewport().rect().center()
+            scene_center = self.view.mapToScene(viewport_center)
 
         self.video_item.setSize(QSizeF(size))
         self.scene.setSceneRect(self.video_item.boundingRect())
@@ -1612,6 +1618,13 @@ class Player(QMainWindow):
         self.view.fitInView(self.video_item, aspect_mode)
         if self.user_zoom != 1.0:
             self.view.scale(self.user_zoom, self.user_zoom)
+        if scene_center is not None:
+            scene_rect = self.scene.sceneRect()
+            clamped_center = QPointF(
+                clamp(scene_center.x(), scene_rect.left(), scene_rect.right()),
+                clamp(scene_center.y(), scene_rect.top(), scene_rect.bottom()),
+            )
+            self.view.centerOn(clamped_center)
 
     def _on_duration(self, duration):
         self.slider.setRange(0, duration)
