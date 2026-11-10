@@ -1,6 +1,7 @@
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import sys
@@ -13,6 +14,7 @@ from pathlib import Path
 from PyQt6.QtCore import (
     QEasingCurve,
     QEvent,
+    QPointF,
     QPropertyAnimation,
     QSettings,
     QSignalBlocker,
@@ -46,6 +48,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QMenu,
+    QMessageBox,
     QPushButton,
     QSlider,
     QStyle,
@@ -54,6 +57,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
+from macos_hotkeys import F16, F17, F18, GlobalHotkeys
 from video_player_metadata import (
     APP_BUILD,
     APP_DISPLAY_NAME,
@@ -87,9 +91,10 @@ SUBTITLE_COLORS = {
 }
 DEFAULT_SUBTITLE_SIZE = 30
 DEFAULT_SUBTITLE_COLOR = "White"
-KEYBOARD_SKIP_MS = 5_000
 KEYBOARD_MEDIUM_SKIP_MS = 10_000
 KEYBOARD_LARGE_SKIP_MS = 30_000
+REMOTE_JOG_STEP_MS = 250
+REMOTE_JOG_INTERVAL_MS = 33
 
 RESUME_MIN_MS = 10_000
 RESUME_END_CLEARANCE_MS = 30_000
@@ -310,7 +315,7 @@ class VideoApp(QApplication):
                 border: 1px solid rgba(255, 255, 255, 0.05);
                 border-radius: 14px;
             }
-            QPushButton#controlButton {
+            QPushButton#controlButton, QPushButton#remoteModeButton {
                 color: #eef3f8;
                 background: transparent;
                 border: none;
@@ -319,11 +324,15 @@ class VideoApp(QApplication):
                 min-height: 26px;
                 font-weight: 600;
             }
-            QPushButton#controlButton:hover {
+            QPushButton#controlButton:hover, QPushButton#remoteModeButton:hover {
                 background: rgba(255, 255, 255, 0.08);
             }
-            QPushButton#controlButton:pressed {
+            QPushButton#controlButton:pressed, QPushButton#remoteModeButton:pressed {
                 background: rgba(255, 255, 255, 0.14);
+            }
+            QPushButton#remoteModeButton:checked {
+                background: #285280;
+                color: #ffffff;
             }
             QPushButton#transportButton {
                 color: #f6f9fc;
@@ -452,64 +461,106 @@ class VideoApp(QApplication):
 
 
 class ControlHandler(BaseHTTPRequestHandler):
-    player_ref = None
+    timeout = 2
+    max_body_bytes = 64 * 1024
+    actions = {
+        "/play": ("play", None),
+        "/pause": ("pause", None),
+        "/toggle": ("toggle", None),
+        "/skip": ("skip", "seconds"),
+        "/seek": ("seek", "seconds"),
+        "/speed": ("speed", "rate"),
+        "/volume": ("volume", "level"),
+        "/mute": ("mute", "on"),
+        "/zoom": ("zoom", "factor"),
+        "/reset_zoom": ("reset_zoom", None),
+        "/open": ("open", "path"),
+        "/pip": ("pip", "on"),
+        "/view_mode": ("view_mode", "mode"),
+        "/cycle_view_mode": ("cycle_view_mode", None),
+        "/fullscreen": ("fullscreen", "on"),
+        "/subtitles/open": ("subtitles_open", "path"),
+        "/subtitles/toggle": ("subtitles_toggle", None),
+        "/subtitles/enabled": ("subtitles_enabled", "on"),
+        "/subtitles/delay": ("subtitles_delay", "ms"),
+        "/subtitles/size": ("subtitles_size", "size"),
+        "/subtitles/color": ("subtitles_color", "name"),
+    }
 
     def _json(self, data, status=200):
         body = json.dumps(data).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionError, TimeoutError):
+            self.close_connection = True
 
     def _body(self):
-        length = int(self.headers.get("Content-Length", 0))
+        if self.headers.get("Transfer-Encoding"):
+            self._json({"error": "Transfer-Encoding is not supported"}, 400)
+            return None
+        lengths = self.headers.get_all("Content-Length", [])
+        try:
+            length = int(lengths[0]) if lengths else 0
+            if len(lengths) > 1 or length < 0:
+                raise ValueError
+        except ValueError:
+            self._json({"error": "invalid Content-Length"}, 400)
+            return None
+        if length > self.max_body_bytes:
+            self._json({"error": "request body is too large"}, 413)
+            return None
         if not length:
             return {}
         try:
-            return json.loads(self.rfile.read(length))
-        except Exception:
-            return {}
+            body = self.rfile.read(length)
+        except TimeoutError:
+            self._json({"error": "timed out reading request body"}, 408)
+            return None
+        except ConnectionError:
+            return None
+        if len(body) != length:
+            self._json({"error": "incomplete request body"}, 400)
+            return None
+        try:
+            data = json.loads(body)
+        except (ValueError, RecursionError):
+            data = None
+        if not isinstance(data, dict):
+            self._json({"error": "request body must be a JSON object"}, 400)
+            return None
+        return data
 
     def do_GET(self):
         if self.path == "/state":
-            self._json(self.player_ref.get_state_snapshot())
+            player = self.server.player_ref
+            if player is None:
+                self._json({"error": "Video Player is shutting down"}, 503)
+                return
+            self._json(player.get_state_snapshot())
         elif self.path == "/health":
             self._json({"ok": True, "app": APP_NAME, "version": APP_VERSION})
         else:
             self._json({"error": "unknown path"}, 404)
 
     def do_POST(self):
-        data = self._body()
-        action_map = {
-            "/play": ("play", None),
-            "/pause": ("pause", None),
-            "/toggle": ("toggle", None),
-            "/skip": ("skip", data.get("seconds")),
-            "/seek": ("seek", data.get("seconds")),
-            "/speed": ("speed", data.get("rate")),
-            "/volume": ("volume", data.get("level")),
-            "/mute": ("mute", data.get("on")),
-            "/zoom": ("zoom", data.get("factor")),
-            "/reset_zoom": ("reset_zoom", None),
-            "/open": ("open", data.get("path")),
-            "/pip": ("pip", data.get("on")),
-            "/view_mode": ("view_mode", data.get("mode")),
-            "/cycle_view_mode": ("cycle_view_mode", None),
-            "/fullscreen": ("fullscreen", data.get("on")),
-            "/subtitles/open": ("subtitles_open", data.get("path")),
-            "/subtitles/toggle": ("subtitles_toggle", None),
-            "/subtitles/enabled": ("subtitles_enabled", data.get("on")),
-            "/subtitles/delay": ("subtitles_delay", data.get("ms")),
-            "/subtitles/size": ("subtitles_size", data.get("size")),
-            "/subtitles/color": ("subtitles_color", data.get("name")),
-        }
-        if self.path in action_map:
-            action, arg = action_map[self.path]
-            self.player_ref.control_signal.emit(action, arg)
-            self._json({"ok": True, "action": action})
-        else:
+        route = self.actions.get(self.path)
+        if route is None:
             self._json({"error": "unknown path"}, 404)
+            return
+        data = self._body()
+        if data is None:
+            return
+        player = self.server.player_ref
+        if player is None:
+            self._json({"error": "Video Player is shutting down"}, 503)
+            return
+        action, field = route
+        player.control_signal.emit(action, data.get(field) if field else None)
+        self._json({"ok": True, "action": action})
 
     def log_message(self, *args, **kwargs):
         pass
@@ -644,7 +695,7 @@ class Player(QMainWindow):
         self.http_server = None
 
         self.settings = self._open_settings()
-        self.skip_seconds = int(self.settings.value("skip_seconds", DEFAULT_SKIP))
+        self.skip_seconds = self._number_setting("skip_seconds", DEFAULT_SKIP)
         if self.skip_seconds not in SKIP_PRESETS:
             self.skip_seconds = DEFAULT_SKIP
         self.view_mode = str(self.settings.value("view_mode", "fit"))
@@ -653,8 +704,8 @@ class Player(QMainWindow):
         self.subtitle_enabled = str(
             self.settings.value("subtitle_enabled", "true")
         ).lower() != "false"
-        self.subtitle_delay_ms = int(self.settings.value("subtitle_delay_ms", 0))
-        self.subtitle_size = int(self.settings.value("subtitle_size", DEFAULT_SUBTITLE_SIZE))
+        self.subtitle_delay_ms = self._number_setting("subtitle_delay_ms", 0)
+        self.subtitle_size = self._number_setting("subtitle_size", DEFAULT_SUBTITLE_SIZE)
         if self.subtitle_size not in SUBTITLE_SIZE_OPTIONS:
             self.subtitle_size = DEFAULT_SUBTITLE_SIZE
         self.subtitle_color_name = str(
@@ -665,12 +716,19 @@ class Player(QMainWindow):
         self.current_file = None
         self.user_zoom = 1.0
         self._resume_pending = False
-        self._resume_path = None
+        self._changing_source = False
         self._pip_mode = False
         self._pip_restore_geometry = None
         self._pip_restore_fullscreen = False
         self._overlay_visible = True
         self._shortcuts = []
+        self._replay_hotkeys = None
+        self._remote_seek_target = None
+        self._remote_seek_timer = QTimer(self)
+        self._remote_seek_timer.setSingleShot(True)
+        self._remote_seek_timer.setInterval(REMOTE_JOG_INTERVAL_MS)
+        self._remote_seek_timer.timeout.connect(self._flush_remote_seek)
+        self._displayed_time = None
         self.subtitle_entries = []
         self.subtitle_starts = []
         self.subtitle_file = None
@@ -768,7 +826,7 @@ class Player(QMainWindow):
 
         self.player = QMediaPlayer(self)
         self.audio = QAudioOutput(self)
-        self.audio.setVolume(float(self.settings.value("volume", 0.85)))
+        self.audio.setVolume(clamp(self._number_setting("volume", 0.85), 0.0, 1.0))
         self.audio.setMuted(str(self.settings.value("muted", "false")).lower() == "true")
         self.player.setAudioOutput(self.audio)
         self.player.setVideoOutput(self.video_item)
@@ -782,6 +840,7 @@ class Player(QMainWindow):
 
         self.player.durationChanged.connect(self._on_duration)
         self.player.positionChanged.connect(self._on_position)
+        self.player.seekableChanged.connect(self._restore_position)
         self.player.playbackStateChanged.connect(self._on_playback_state_changed)
         self.player.mediaStatusChanged.connect(self._on_media_status_changed)
         self.player.errorOccurred.connect(self._on_error)
@@ -823,8 +882,16 @@ class Player(QMainWindow):
         settings.sync()
         return settings
 
+    def _number_setting(self, key, default):
+        try:
+            value = type(default)(self.settings.value(key, default))
+            if math.isfinite(value):
+                return value
+        except (TypeError, ValueError, OverflowError):
+            pass
+        return default
+
     def _start_control_server(self):
-        ControlHandler.player_ref = self
         if not self.control_server_enabled:
             LOG.info("Control server disabled by configuration")
             self._update_state(control_server_enabled=False)
@@ -844,7 +911,12 @@ class Player(QMainWindow):
             self._update_state(control_server_enabled=False)
             return
 
-        thread = threading.Thread(target=self.http_server.serve_forever, daemon=True)
+        self.http_server.player_ref = self
+        thread = threading.Thread(
+            target=self.http_server.serve_forever,
+            kwargs={"poll_interval": 0.05},
+            daemon=True,
+        )
         thread.start()
         LOG.info(
             "Control server listening on http://%s:%s",
@@ -852,6 +924,15 @@ class Player(QMainWindow):
             self.control_port,
         )
         self._update_state(control_server_enabled=True)
+
+    def _stop_control_server(self):
+        server = self.http_server
+        if server is not None:
+            self.http_server = None
+            server.player_ref = None
+            server.shutdown()
+            server.server_close()
+            self._update_state(control_server_enabled=False)
 
     def get_state_snapshot(self):
         with self._state_lock:
@@ -888,12 +969,24 @@ class Player(QMainWindow):
         self.slider = ClickableSlider(Qt.Orientation.Horizontal)
         self.slider.setObjectName("seekSlider")
         self.slider.pointer_activity.connect(self._on_pointer_activity)
-        self.slider.sliderMoved.connect(self.player.setPosition)
+        self.slider.sliderMoved.connect(self._seek_to)
         timeline_row.addWidget(self.slider, 1)
 
         self.time_label = QLabel("0:00 / 0:00")
         self.time_label.setObjectName("timeLabel")
         timeline_row.addWidget(self.time_label)
+
+        if sys.platform == "darwin":
+            self.replay_remote_btn = QPushButton("Remote Mode")
+            self.replay_remote_btn.setObjectName("remoteModeButton")
+            self.replay_remote_btn.setCheckable(True)
+            self.replay_remote_btn.setToolTip(
+                "Control playback with the remote while another app has focus"
+            )
+            self.replay_remote_btn.clicked.connect(self._set_replay_remote)
+            self.replay_remote_btn.installEventFilter(self)
+            timeline_row.addWidget(self.replay_remote_btn)
+
         timeline_shell_layout.addLayout(timeline_row)
 
         timeline_wrap = QHBoxLayout()
@@ -918,12 +1011,12 @@ class Player(QMainWindow):
 
         self.back_btn = QPushButton()
         self.back_btn.setObjectName("controlButton")
-        self.back_btn.clicked.connect(lambda: self.skip(-self.skip_seconds * 1000))
+        self.back_btn.clicked.connect(lambda: self.skip(-self._skip_interval_ms()))
         controls_row.addWidget(self.back_btn)
 
         self.fwd_btn = QPushButton()
         self.fwd_btn.setObjectName("controlButton")
-        self.fwd_btn.clicked.connect(lambda: self.skip(self.skip_seconds * 1000))
+        self.fwd_btn.clicked.connect(lambda: self.skip(self._skip_interval_ms()))
         controls_row.addWidget(self.fwd_btn)
 
         self.skip_combo = QComboBox()
@@ -937,6 +1030,7 @@ class Player(QMainWindow):
         self.skip_combo.setCurrentIndex(index)
         self.skip_combo.setToolTip("Skip interval")
         self.skip_combo.currentIndexChanged.connect(self._on_skip_changed)
+        self._on_skip_changed(self.skip_combo.currentIndex())
         controls_row.addWidget(self.skip_combo)
 
         self.mute_btn = QPushButton("Mute")
@@ -1030,6 +1124,12 @@ class Player(QMainWindow):
         self.pip_act.triggered.connect(self.set_pip_mode)
         player_menu.addAction(self.pip_act)
 
+        if sys.platform == "darwin":
+            self.replay_remote_act = QAction("Remote Mode", self)
+            self.replay_remote_act.setCheckable(True)
+            self.replay_remote_act.triggered.connect(self._set_replay_remote)
+            player_menu.addAction(self.replay_remote_act)
+
         player_menu.addSeparator()
 
         crop_menu = player_menu.addMenu("Crop Mode")
@@ -1048,7 +1148,7 @@ class Player(QMainWindow):
 
         self.cycle_view_mode_act = QAction("Cycle Crop Mode", self)
         self.cycle_view_mode_act.setShortcut("C")
-        self.cycle_view_mode_act.triggered.connect(self.cycle_view_mode)
+        self.cycle_view_mode_act.triggered.connect(lambda: self.cycle_view_mode())
         player_menu.addAction(self.cycle_view_mode_act)
 
         subtitles_menu = self.menuBar().addMenu("Subtitles")
@@ -1133,12 +1233,65 @@ class Player(QMainWindow):
         player_menu.addAction(self.fullscreen_act)
         player_menu.addAction(self.pip_act)
         player_menu.addAction(self.cycle_view_mode_act)
+        if sys.platform == "darwin":
+            player_menu.addAction(self.replay_remote_act)
 
         crop_menu = player_menu.addMenu("Crop Mode")
         for action in self.view_mode_actions.values():
             crop_menu.addAction(action)
 
         menu.exec(self.view.mapToGlobal(position))
+
+    def _set_replay_remote(self, enabled):
+        error = None
+        if enabled and self._replay_hotkeys is None:
+            try:
+                self._replay_hotkeys = GlobalHotkeys((
+                    (F16, lambda: self._jog_remote(-REMOTE_JOG_STEP_MS)),
+                    (F17, self._toggle_remote_play),
+                    (F18, lambda: self._jog_remote(REMOTE_JOG_STEP_MS)),
+                ))
+            except OSError as exc:
+                error = exc
+        elif not enabled and self._replay_hotkeys is not None:
+            self._replay_hotkeys.close()
+            self._replay_hotkeys = None
+            self._cancel_remote_seek()
+
+        if sys.platform == "darwin":
+            active = self._replay_hotkeys is not None
+            self.replay_remote_btn.setChecked(active)
+            self.replay_remote_act.setChecked(active)
+        if error:
+            LOG.warning("Could not enable remote mode: %s", error)
+            QMessageBox.warning(
+                self, "Remote Mode",
+                "Video Player could not reserve F16, F17, and F18. "
+                "If another app uses these shortcuts, close it and try again.",
+            )
+
+    def _jog_remote(self, delta_ms):
+        duration = self.player.duration()
+        if not self.player.isSeekable() or duration <= 0:
+            return
+        position = self._remote_seek_target
+        if position is None:
+            position = self.player.position()
+        self._remote_seek_target = clamp(position + delta_ms, 0, duration)
+        if not self._remote_seek_timer.isActive():
+            self._remote_seek_timer.start()
+
+    def _flush_remote_seek(self):
+        if self._remote_seek_target is not None:
+            self._seek_to(self._remote_seek_target)
+
+    def _cancel_remote_seek(self):
+        self._remote_seek_timer.stop()
+        self._remote_seek_target = None
+
+    def _toggle_remote_play(self):
+        self._flush_remote_seek()
+        self.toggle_play()
 
     def _build_shortcuts(self):
         context = Qt.ShortcutContext.ApplicationShortcut
@@ -1152,8 +1305,8 @@ class Player(QMainWindow):
                 self._shortcuts.append(shortcut)
 
         bind(["Space", "K"], self.toggle_play)
-        bind(["Left", "J"], lambda: self.skip(-KEYBOARD_SKIP_MS))
-        bind(["Right", "L"], lambda: self.skip(KEYBOARD_SKIP_MS))
+        bind(["Left", "J"], lambda: self.skip(-self._skip_interval_ms()))
+        bind(["Right", "L"], lambda: self.skip(self._skip_interval_ms()))
         bind("Shift+Left", lambda: self.skip(-KEYBOARD_MEDIUM_SKIP_MS))
         bind("Shift+Right", lambda: self.skip(KEYBOARD_MEDIUM_SKIP_MS))
         bind("Alt+Left", lambda: self.skip(-KEYBOARD_LARGE_SKIP_MS))
@@ -1161,10 +1314,7 @@ class Player(QMainWindow):
         bind("M", lambda: self.set_muted(not self.audio.isMuted(), show_osd=True))
         bind("Up", lambda: self.set_volume(self.audio.volume() + 0.05, show_osd=True))
         bind("Down", lambda: self.set_volume(self.audio.volume() - 0.05, show_osd=True))
-        bind("F", self.toggle_fullscreen)
         bind("Escape", self.exit_fullscreen)
-        bind("P", lambda: self.set_pip_mode(not self._pip_mode))
-        bind("C", self.cycle_view_mode)
         bind("Shift+C", lambda: self.cycle_view_mode(-1))
         bind("[", lambda: self.cycle_speed(-1))
         bind("]", lambda: self.cycle_speed(1))
@@ -1199,9 +1349,10 @@ class Player(QMainWindow):
         if self.current_file:
             self._save_position()
 
+        self._cancel_remote_seek()
         self.current_file = path
         self._resume_pending = True
-        self._resume_path = path
+        self._displayed_time = None
         self.user_zoom = 1.0
         LOG.info("Opening video: %s", path)
 
@@ -1216,10 +1367,18 @@ class Player(QMainWindow):
             position_text="0:00",
             zoom=self.user_zoom,
         )
-        self.player.setSource(QUrl.fromLocalFile(path))
-        self.player.play()
-        self._sync_zoom_ui()
         self.show_osd("Opening video")
+        source = QUrl.fromLocalFile(path)
+        self._changing_source = True
+        try:
+            if self.player.source() == source:
+                self.player.setSource(QUrl())
+            self.player.setSource(source)
+        finally:
+            self._changing_source = False
+        self.player.play()
+        self._on_duration(self.player.duration())
+        self._sync_zoom_ui()
         self._on_pointer_activity()
 
     def _handle_control(self, action, arg):
@@ -1233,7 +1392,7 @@ class Player(QMainWindow):
             elif action == "skip" and arg is not None:
                 self.skip(int(float(arg) * 1000))
             elif action == "seek" and arg is not None:
-                self.player.setPosition(int(float(arg) * 1000))
+                self._seek_to(int(float(arg) * 1000))
             elif action == "speed" and arg is not None:
                 self.set_speed(float(arg), show_osd=False)
             elif action == "volume" and arg is not None:
@@ -1277,15 +1436,32 @@ class Player(QMainWindow):
         else:
             self.player.play()
 
-    def skip(self, ms):
+    def skip(self, ms, *, show_osd=False):
         duration = self.player.duration()
         new_position = max(0, min(duration, self.player.position() + ms))
-        self.player.setPosition(new_position)
-        direction = "+" if ms >= 0 else ""
-        self.show_osd(f"{direction}{ms / 1000:.0f}s")
+        self._seek_to(new_position)
+
+        if show_osd:
+            direction = "+" if ms >= 0 else ""
+            self.show_osd(f"{direction}{ms / 1000:.0f}s")
+
+    def _seek_to(self, position_ms):
+        self._cancel_remote_seek()
+        self.player.setPosition(position_ms)
+
+    def _skip_interval_ms(self):
+        current = self.skip_combo.currentData() if hasattr(self, "skip_combo") else None
+        try:
+            seconds = int(current)
+        except (TypeError, ValueError):
+            seconds = int(self.skip_seconds)
+        return seconds * 1000
 
     def _on_skip_changed(self, _index):
-        self.skip_seconds = int(self.skip_combo.currentData())
+        current = self.skip_combo.currentData()
+        if current is None:
+            return
+        self.skip_seconds = int(current)
         self.settings.setValue("skip_seconds", self.skip_seconds)
         self._refresh_skip_labels()
         self._update_state(skip_seconds=self.skip_seconds)
@@ -1552,38 +1728,45 @@ class Player(QMainWindow):
         index = VIEW_MODES.index(self.view_mode)
         self.set_view_mode(VIEW_MODES[(index + direction) % len(VIEW_MODES)])
 
-    def zoom_by(self, factor, absolute=False):
+    def zoom_by(self, factor, absolute=False, show_osd=False):
         if absolute:
-            self.user_zoom = clamp(float(factor), 1.0, 8.0)
+            self.user_zoom = clamp(float(factor), 0.1, 8.0)
         else:
-            self.user_zoom = clamp(self.user_zoom * float(factor), 1.0, 8.0)
-        self._apply_view_transform()
+            self.user_zoom = clamp(self.user_zoom * float(factor), 0.1, 8.0)
+        self._apply_view_transform(preserve_center=True)
         self._sync_zoom_ui()
         self._update_state(zoom=round(self.user_zoom, 3))
-        self.show_osd(f"Zoom {self.user_zoom:.2f}x")
+        if show_osd:
+            self.show_osd(f"Zoom {self.user_zoom:.2f}x")
 
-    def reset_zoom(self):
+    def reset_zoom(self, show_osd=False):
         self.user_zoom = 1.0
-        self._apply_view_transform()
+        self._apply_view_transform(preserve_center=False)
         self._sync_zoom_ui()
         self._update_state(zoom=self.user_zoom)
-        self.show_osd("Zoom reset")
+        if show_osd:
+            self.show_osd("Zoom reset")
 
     def _sync_zoom_ui(self):
         percent = int(round(self.user_zoom * 100))
         self.zoom_reset_btn.setText(f"{percent}%")
         self.zoom_reset_btn.setEnabled(self.user_zoom != 1.0)
-        self.zoom_out_btn.setEnabled(self.user_zoom > 1.0)
+        self.zoom_out_btn.setEnabled(self.user_zoom > 0.1)
         self.zoom_in_btn.setEnabled(self.user_zoom < 8.0)
         self.view.set_pan_enabled(self.user_zoom > 1.0)
 
     def _fit_video(self, _size):
         self._apply_view_transform()
 
-    def _apply_view_transform(self):
+    def _apply_view_transform(self, preserve_center=False):
         size = self.video_item.nativeSize()
         if not size.isValid() or size.width() <= 0 or size.height() <= 0:
             return
+
+        scene_center = None
+        if preserve_center and self.scene.sceneRect().isValid():
+            viewport_center = self.view.viewport().rect().center()
+            scene_center = self.view.mapToScene(viewport_center)
 
         self.video_item.setSize(QSizeF(size))
         self.scene.setSceneRect(self.video_item.boundingRect())
@@ -1596,37 +1779,62 @@ class Player(QMainWindow):
         self.view.fitInView(self.video_item, aspect_mode)
         if self.user_zoom != 1.0:
             self.view.scale(self.user_zoom, self.user_zoom)
+        if scene_center is not None:
+            scene_rect = self.scene.sceneRect()
+            clamped_center = QPointF(
+                clamp(scene_center.x(), scene_rect.left(), scene_rect.right()),
+                clamp(scene_center.y(), scene_rect.top(), scene_rect.bottom()),
+            )
+            self.view.centerOn(clamped_center)
 
     def _on_duration(self, duration):
+        if self._changing_source:
+            return
         self.slider.setRange(0, duration)
-        self._update_time()
-        self._update_state(duration_ms=duration, duration_text=format_ms(duration))
-        if self._resume_pending and self.current_file == self._resume_path:
-            self._restore_position(duration)
+        self._update_time(self.player.position(), duration)
+        self._restore_position()
 
-    def _restore_position(self, duration):
+    def _restore_position(self):
+        if not self._resume_pending or not self._owns_media_source():
+            return
+        if self.player.mediaStatus() not in (
+            QMediaPlayer.MediaStatus.LoadedMedia,
+            QMediaPlayer.MediaStatus.BufferingMedia,
+            QMediaPlayer.MediaStatus.BufferedMedia,
+        ):
+            return
+        duration = self.player.duration()
+        if duration <= 0 or not self.player.isSeekable():
+            return
+
         self._resume_pending = False
         resume_ms = self._load_resume_position(self.current_file)
         if self._resume_position_valid(resume_ms, duration):
-            self.player.setPosition(resume_ms)
+            self._seek_to(resume_ms)
             self.show_osd(f"Resumed at {format_ms(resume_ms)}")
         else:
             self._clear_resume_position(self.current_file)
 
     def _on_position(self, position):
+        if self._changing_source:
+            return
         if not self.slider.isSliderDown():
             self.slider.setValue(position)
-        self._update_time()
+        self._update_time(position, self.player.duration())
         self._update_subtitle_display(position)
-        self._update_state(position_ms=position)
 
-    def _update_time(self):
-        position = self.player.position()
-        duration = self.player.duration()
-        position_text = format_ms(position)
-        duration_text = format_ms(duration)
+    def _update_time(self, position, duration):
+        displayed_time = (position // 1000, duration // 1000)
+        if displayed_time == self._displayed_time:
+            self._update_state(position_ms=position, duration_ms=duration)
+            return
+        self._displayed_time = displayed_time
+        position_text, duration_text = format_ms(position), format_ms(duration)
         self.time_label.setText(f"{position_text} / {duration_text}")
-        self._update_state(position_text=position_text, duration_text=duration_text)
+        self._update_state(
+            position_ms=position, duration_ms=duration,
+            position_text=position_text, duration_text=duration_text,
+        )
 
     def _on_playback_state_changed(self, state):
         playing = state == QMediaPlayer.PlaybackState.PlayingState
@@ -1644,9 +1852,18 @@ class Player(QMainWindow):
             self._set_overlay_visible(True)
 
     def _on_media_status_changed(self, status):
-        if status == QMediaPlayer.MediaStatus.EndOfMedia:
+        if status == QMediaPlayer.MediaStatus.EndOfMedia and self._owns_media_source():
             self._clear_resume_position(self.current_file)
             self.show_osd("Finished")
+        else:
+            self._restore_position()
+
+    def _owns_media_source(self):
+        return (
+            not self._changing_source
+            and bool(self.current_file)
+            and self.player.source().toLocalFile() == self.current_file
+        )
 
     def _resume_key(self, path):
         encoded = path.encode("utf-8", errors="surrogatepass").hex()
@@ -1673,7 +1890,7 @@ class Player(QMainWindow):
         return True
 
     def _save_position(self):
-        if not self.current_file:
+        if self._resume_pending or not self._owns_media_source():
             return
         position = self.player.position()
         duration = self.player.duration()
@@ -1681,14 +1898,12 @@ class Player(QMainWindow):
             return
         if self._resume_position_valid(position, duration):
             self.settings.setValue(self._resume_key(self.current_file), int(position))
-            self.settings.sync()
         else:
             self._clear_resume_position(self.current_file)
 
     def _clear_resume_position(self, path):
         if path:
             self.settings.remove(self._resume_key(path))
-            self.settings.sync()
 
     def _refresh_meta_label(self):
         if self.current_file:
@@ -1782,8 +1997,8 @@ class Player(QMainWindow):
     def show_osd(self, text):
         self.osd_label.setText(text)
         self.osd_label.adjustSize()
-        self._layout_overlay_widgets()
         self.osd_label.show()
+        self._layout_overlay_widgets()
         self.osd_label.raise_()
         self.osd_timer.start(1200)
 
@@ -1877,14 +2092,14 @@ class Player(QMainWindow):
 
     def closeEvent(self, event):
         LOG.info("Closing %s", APP_NAME)
+        self._set_replay_remote(False)
         self._save_position()
         self.settings.setValue("window_geometry", self.saveGeometry())
         self.settings.setValue("volume", self.audio.volume())
         self.settings.setValue("muted", "true" if self.audio.isMuted() else "false")
         self.settings.setValue("view_mode", self.view_mode)
-        if getattr(self, "http_server", None):
-            self.http_server.shutdown()
-            self.http_server.server_close()
+        self.settings.sync()
+        self._stop_control_server()
         super().closeEvent(event)
 
 

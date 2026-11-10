@@ -8,6 +8,7 @@ import json
 import os
 import urllib.error
 import urllib.request
+from http.client import HTTPException
 from typing import Any
 
 from mcp.server import Server
@@ -15,6 +16,33 @@ from mcp.server.stdio import stdio_server
 from mcp.types import TextContent, Tool
 
 BASE = os.environ.get("VIDEO_PLAYER_BASE_URL", "http://127.0.0.1:9876").rstrip("/")
+_request_lock = asyncio.Lock()
+
+
+def _request(request: urllib.request.Request) -> dict:
+    try:
+        response = urllib.request.urlopen(request, timeout=2)
+    except urllib.error.HTTPError as error:
+        response = error
+    except (OSError, HTTPException) as error:
+        return {"error": f"Video Player not reachable at {BASE} — is the app running? ({error})"}
+
+    with response:
+        status = response.getcode()
+        try:
+            result = json.loads(response.read() or b"{}")
+        except (OSError, HTTPException) as error:
+            return {"error": f"Could not read Video Player response at {BASE} ({error})"}
+        except (ValueError, RecursionError):
+            result = None
+
+    if status >= 400:
+        if isinstance(result, dict) and "error" in result:
+            return result
+        return {"error": f"Video Player returned HTTP {status}"}
+    if not isinstance(result, dict):
+        return {"error": f"Video Player returned an invalid JSON response at {BASE}"}
+    return result
 
 
 def _post(path: str, data: dict | None = None) -> dict:
@@ -23,19 +51,11 @@ def _post(path: str, data: dict | None = None) -> dict:
         BASE + path, data=body, method="POST",
         headers={"Content-Type": "application/json"},
     )
-    try:
-        with urllib.request.urlopen(req, timeout=2) as r:
-            return json.loads(r.read() or b"{}")
-    except urllib.error.URLError as e:
-        return {"error": f"Video Player not reachable at {BASE} — is the app running? ({e})"}
+    return _request(req)
 
 
 def _get(path: str) -> dict:
-    try:
-        with urllib.request.urlopen(BASE + path, timeout=2) as r:
-            return json.loads(r.read() or b"{}")
-    except urllib.error.URLError as e:
-        return {"error": f"Video Player not reachable at {BASE} — is the app running? ({e})"}
+    return _request(urllib.request.Request(BASE + path))
 
 
 app = Server("video-player")
@@ -155,7 +175,12 @@ async def list_tools() -> list[Tool]:
 
 @app.call_tool()
 async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
-    args = arguments or {}
+    async with _request_lock:
+        result = await asyncio.to_thread(_dispatch, name, arguments or {})
+    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+
+
+def _dispatch(name: str, args: dict[str, Any]) -> dict:
     if name == "health":
         result = _get("/health")
     elif name == "state":
@@ -204,7 +229,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
         result = _post("/subtitles/color", {"name": args["name"]})
     else:
         result = {"error": f"unknown tool: {name}"}
-    return [TextContent(type="text", text=json.dumps(result, indent=2))]
+    return result
 
 
 async def main() -> None:

@@ -19,6 +19,7 @@ Video Player is an open source macOS player built around the stuff that actually
 ## Features
 
 - Smooth timeline scrubbing with `5s`, `10s`, and `30s` skip intervals
+- Optional Remote Mode for one-handed replay with Xencelabs Quick Keys, even while another app has focus
 - Zoom, fit, fill, and stretch crop modes
 - Playback speed control from `0.25x` to `3x`
 - Keyboard shortcuts for play/pause, seek, fullscreen, mute, zoom, and crop modes
@@ -157,15 +158,31 @@ More release details live in [video-player-build/README.md](video-player-build/R
 ## Keyboard Shortcuts
 
 - `Space` or `K`: play/pause
-- `Left` / `Right`: seek `5s`
+- `Left` / `Right` or `J` / `L`: seek by the selected skip interval
 - `Shift+Left` / `Shift+Right`: seek `10s`
-- `Ctrl+Left` / `Ctrl+Right`: seek `30s`
+- `Option+Left` / `Option+Right`: seek `30s`
 - `F`: fullscreen
 - `M`: mute
-- `Z`: reset zoom
+- `Z` / `Shift+Z`: zoom in or out
+- `0`: reset zoom
 - `C`: cycle crop mode
 - `P`: mini-player
 - `,` / `.`: subtitle delay
+
+## Xencelabs Quick Keys Remote Mode
+
+Click **Remote Mode** next to the playback controls to use Quick Keys while entering stats in another app. Click it again to release the shortcuts. The timeline, playback buttons, and regular keyboard shortcuts are available in either mode.
+
+1. Connect Quick Keys with its USB receiver or cable and install the macOS driver. [Xencelabs drivers](https://www.xencelabs.com/us/support/download-drivers)
+2. In Xencelabs Settings, choose **My Quick Keys → All Other**. Under **Dial Mode 1**, choose **Keystroke**. Use **Add Special** to select the function keys in the table. Assign play/pause to one of the side buttons. The dial's center button switches dial modes. [Xencelabs dial setup](https://solutions.xencelabs.com/en/support/solutions/articles/67000704399-setting-up-your-quick-keys-for-adobe-premiere-pro)
+
+   | Control | Key | Video Player action |
+   | --- | --- | --- |
+   | Dial counterclockwise (top field) | `F16` | Jog backward ¼ second |
+   | Dial clockwise (bottom field) | `F18` | Jog forward ¼ second |
+   | A programmable side button | `F17` | Play or pause |
+
+3. Switch Quick Keys to that dial mode and click **Remote Mode** in Video Player. If your stats app or Video Player already has a custom Quick Keys profile, copy the same mappings into that profile. [Xencelabs app profiles](https://solutions.xencelabs.com/en/support/solutions/articles/67000685362-how-many-applications-can-i-customize-within-the-xencelabs-driver-)
 
 ## Open Source
 
