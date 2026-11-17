@@ -34,12 +34,14 @@ Video Player is an open source macOS player built around the stuff that actually
 
 - `video_player.py`: main desktop app
 - `video_player_metadata.py`: version, bundle, and settings metadata
+- `macos_quick_keys.py` and `quick_keys_profile.py`: built-in remote controls and screen labels
+- `jog_frame_cache.py`: full-resolution frames for the jog dial
 - `video_player_mcp/server.py`: MCP bridge to the local HTTP API
 - `video-player-build/`: icon generation, packaging, smoke tests, and release scripts
 
 ## Requirements
 
-- macOS 11+
+- macOS 13+
 - Python 3.14 recommended
 - Homebrew or another Python install with Qt multimedia support
 
@@ -173,7 +175,9 @@ More release details live in [video-player-build/README.md](video-player-build/R
 
 Click **Remote Mode** next to the playback controls to use Quick Keys while entering stats in another app. Video Player remembers whether you left Remote Mode on or off. The timeline, playback buttons, and regular keyboard shortcuts are available in either mode.
 
-Connect Quick Keys by USB cable or its paired Xencelabs wireless receiver and keep the Xencelabs driver running. A quarter turn moves 18 frames in the direction you turn. Press the center of the dial to play or pause. With FFmpeg installed, the player preloads nearby frames at source resolution for smoother scrubbing. The player combines steps if the target frames are still decoding. Use the Replay dial mode in the driver so the dial doesn't also send scroll or zoom commands to the foreground app.
+The packaged app includes the video decoder and Quick Keys setup. Drag Video Player into Applications, open it, and connect Quick Keys by USB cable or its paired wireless receiver. Remote Mode starts enabled on a new installation, and the app applies the screen labels and dial settings automatically.
+
+A quarter turn moves 18 frames in the direction you turn. Press the center of the dial to play or pause. The bundled decoder preloads nearby frames at source resolution for smoother scrubbing, including when zoomed in. The player combines steps if the target frames are still decoding.
 
 With the dial at the top, the controls are arranged in four rows.
 
@@ -184,10 +188,9 @@ With the dial at the top, the controls are arranged in four rows.
 | 3 | Pan Left | Pan Right |
 | 4 | Pan Down | Pan Up |
 
-Use the following shortcuts to set the OLED labels on the remote or to configure another shortcut source.
+Use the same remote and paired receiver when moving to another Mac. Video Player controls the remote while Remote Mode is enabled. Turn Remote Mode off to return it to other applications.
 
-1. Connect Quick Keys and install the macOS driver. [Xencelabs drivers](https://www.xencelabs.com/us/support/download-drivers)
-2. In Xencelabs Settings, choose **My Quick Keys → All Other**. Set **Dial Mode 1** and the buttons below to **Keystroke**. Use **Add Special** to select the function keys. Enable only the Replay dial mode so its center button can control playback consistently. [Xencelabs dial setup](https://solutions.xencelabs.com/en/support/solutions/articles/67000704399-setting-up-your-quick-keys-for-adobe-premiere-pro)
+For another shortcut source, use the following keyboard mappings. Runs from Python source can use an installed FFmpeg for frame preloading.
 
    | Control | Key | Video Player action |
    | --- | --- | --- |
@@ -202,7 +205,7 @@ Use the following shortcuts to set the OLED labels on the remote or to configure
    | Button 1 | `Shift+Option+F19` | Pan down |
    | Button 5 | `Shift+Option+F18` | Pan up |
 
-3. Switch Quick Keys to that dial mode and click **Remote Mode** in Video Player. For a shortcut-only device, assign `F17` to a button to play or pause. If your stats app or Video Player already has a custom Quick Keys profile, copy the same mappings into that profile. [Xencelabs app profiles](https://solutions.xencelabs.com/en/support/solutions/articles/67000685362-how-many-applications-can-i-customize-within-the-xencelabs-driver-)
+Assign `F17` to a button on a shortcut-only device to play or pause.
 
 ## Open Source
 

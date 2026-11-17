@@ -13,6 +13,7 @@ video-player-build/dist/
 video-player-build/work/
 video-player-build/spec/
 video-player-build/release/
+video-player-build/ffmpeg-build/
 video-player-build/AppIcon.icns
 video-player-build/AppIcon-1024.png
 video-player-build/AppIcon.iconset/

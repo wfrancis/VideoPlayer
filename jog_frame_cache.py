@@ -30,6 +30,10 @@ PIXEL_FORMATS = {
 
 
 def _find_ffmpeg():
+    if getattr(sys, "frozen", False):
+        bundled = Path(sys.executable).resolve().parent.parent / "Resources" / "ffmpeg" / "bin" / "ffmpeg"
+        if bundled.is_file() and os.access(bundled, os.X_OK):
+            return str(bundled)
     if sys.platform == "darwin":
         # Finder doesn't include Homebrew in its default PATH.
         for path in ("/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg"):

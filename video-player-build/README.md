@@ -14,6 +14,7 @@ That will:
 
 - regenerate the `.icns` app icon
 - build a standalone `.app` with PyInstaller
+- build and bundle the FFmpeg decoder from its pinned source, including its LGPL license and source archive
 - ad-hoc sign the app for local use
 - create both `.zip` and `.dmg` artifacts in `release/`
 - replace the installed copy in `/Applications`
@@ -23,6 +24,14 @@ If you only want artifacts and do not want to replace the installed app:
 ```bash
 ./video-player-build/package_app.sh --skip-install
 ```
+
+The current build targets Apple silicon and macOS 13 or later. The first decoder
+build requires internet access and Xcode Command Line Tools. Later builds reuse
+the decoder under the ignored `ffmpeg-build/` directory.
+
+The packaged app includes the decoder and automatically applies the Quick Keys
+labels and controls when Remote Mode starts. A fresh installation starts with
+Remote Mode enabled.
 
 ## Smoke Test
 

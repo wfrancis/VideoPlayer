@@ -181,6 +181,9 @@ sign_bundle() {
   /usr/bin/codesign --verify --deep --strict "$1"
 }
 
+"$VENV/bin/python" "$BUILD_ROOT/bundle_ffmpeg.py" "$APP_BUNDLE" \
+  --cache "$BUILD_ROOT/ffmpeg-build" --identity "$CODESIGN_IDENTITY"
+
 sign_bundle "$APP_BUNDLE"
 
 /usr/bin/ditto -c -k --sequesterRsrc --keepParent "$APP_BUNDLE" "$ZIP_PATH"
@@ -193,7 +196,21 @@ Video Player $APP_VERSION
 
 1. Drag Video Player.app into Applications.
 2. Launch the app from Applications.
-3. If macOS warns that the app was downloaded from the internet, use Open from the context menu the first time.
+3. Connect Quick Keys by USB or plug in its paired wireless receiver and turn it on.
+
+The app includes the decoder for smooth full-resolution scrubbing and automatically
+sets up the remote buttons and screen labels. Remote Mode starts enabled on a new Mac.
+
+Dial center: Play/Pause
+Dial rotation: 18 frames per quarter turn
+Rows from the dial down, left / right:
+-5s / +5s
+Zoom Out / Zoom In
+Pan Left / Pan Right
+Pan Down / Pan Up
+
+This build runs on Apple silicon Macs with macOS 13 or later.
+It is locally signed. macOS may require approval when opening it for the first time.
 TXT
 /usr/bin/hdiutil create \
   -volname "${APP_NAME} ${APP_VERSION}" \

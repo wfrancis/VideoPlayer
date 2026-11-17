@@ -905,7 +905,7 @@ class Player(QMainWindow):
         saved_geometry = self.settings.value("window_geometry")
         if saved_geometry is not None:
             self.restoreGeometry(saved_geometry)
-        if sys.platform == "darwin" and coerce_bool(self.settings.value("remote_mode", False)):
+        if sys.platform == "darwin" and coerce_bool(self.settings.value("remote_mode", True)):
             self._set_replay_remote(True, save_preference=False)
 
     def _open_settings(self):
