@@ -10,6 +10,10 @@ LOG = logging.getLogger("video_player")
 F16 = 0x6A
 F17 = 0x40
 F18 = 0x4F
+F19 = 0x50
+F20 = 0x5A
+SHIFT = 1 << 9
+SHIFT_OPTION = SHIFT | (1 << 11)
 HOTKEY_EXCLUSIVE = 1
 EVENT_NOT_HANDLED = -9874
 
@@ -68,10 +72,10 @@ class GlobalHotkeys:
             raise OSError(f"Could not install the replay remote event handler ({status})")
 
         try:
-            for identifier, (key_code, action) in enumerate(bindings, start=1):
+            for identifier, (key_code, modifiers, action) in enumerate(bindings, start=1):
                 ref = ct.c_void_p()
                 status = carbon.RegisterEventHotKey(
-                    key_code, 0, HotKeyID(HOTKEY_SIGNATURE, identifier), target,
+                    key_code, modifiers, HotKeyID(HOTKEY_SIGNATURE, identifier), target,
                     HOTKEY_EXCLUSIVE, ct.byref(ref),
                 )
                 if status:

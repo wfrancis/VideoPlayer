@@ -7,6 +7,8 @@ import re
 import sys
 import threading
 from bisect import bisect_right
+from dataclasses import dataclass
+from functools import partial
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
@@ -35,7 +37,7 @@ from PyQt6.QtGui import (
     QPalette,
     QShortcut,
 )
-from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer
+from PyQt6.QtMultimedia import QAudioOutput, QMediaPlayer, QVideoSink
 from PyQt6.QtMultimediaWidgets import QGraphicsVideoItem
 from PyQt6.QtWidgets import (
     QApplication,
@@ -57,7 +59,9 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
 )
 
-from macos_hotkeys import F16, F17, F18, GlobalHotkeys
+from jog_frame_cache import JogFrameCache
+from macos_hotkeys import F16, F17, F18, F19, F20, SHIFT, SHIFT_OPTION, GlobalHotkeys
+from macos_quick_keys import QuickKeys
 from video_player_metadata import (
     APP_BUILD,
     APP_DISPLAY_NAME,
@@ -93,8 +97,12 @@ DEFAULT_SUBTITLE_SIZE = 30
 DEFAULT_SUBTITLE_COLOR = "White"
 KEYBOARD_MEDIUM_SKIP_MS = 10_000
 KEYBOARD_LARGE_SKIP_MS = 30_000
-REMOTE_JOG_STEP_MS = 250
-REMOTE_JOG_INTERVAL_MS = 33
+REMOTE_FRAME_TIMEOUT_MS = 1000
+REMOTE_FRAMES_PER_QUARTER = 18
+# A wired Quick Keys sends 32 raw dial reports over a quarter turn.
+REMOTE_TICKS_PER_QUARTER = 32
+REMOTE_SETTLE_MS = 140
+REMOTE_PAN_VIEWPORT_FRACTION = 0.1
 
 RESUME_MIN_MS = 10_000
 RESUME_END_CLEARANCE_MS = 30_000
@@ -102,6 +110,16 @@ OVERLAY_HIDE_MS = 2500
 PAN_DRAG_THRESHOLD = 6
 
 LOG = logging.getLogger("video_player")
+
+
+@dataclass
+class RemoteFrameSeek:
+    origin: int
+    direction: int
+    target: int
+    stride: int
+    lower: int | None = None
+    upper: int | None = None
 
 
 def clamp(value, minimum, maximum):
@@ -616,6 +634,14 @@ class VideoView(QGraphicsView):
             else QGraphicsView.DragMode.NoDrag
         )
 
+    def pan_by(self, dx, dy):
+        if not self._pan_enabled:
+            return
+        horizontal = self.horizontalScrollBar()
+        vertical = self.verticalScrollBar()
+        horizontal.setValue(horizontal.value() + dx)
+        vertical.setValue(vertical.value() + dy)
+
     def mousePressEvent(self, event):
         self.pointer_activity.emit()
         if event.button() == Qt.MouseButton.LeftButton:
@@ -723,11 +749,19 @@ class Player(QMainWindow):
         self._overlay_visible = True
         self._shortcuts = []
         self._replay_hotkeys = None
-        self._remote_seek_target = None
+        self._quick_keys = None
+        self._remote_pending_steps = 0
+        self._remote_frame_seek = None
+        self._remote_dial_remainder = 0
+        self._remote_cache = JogFrameCache(self) if sys.platform == "darwin" else None
+        self._remote_cached_position = None
+        self._remote_cache_waiting = False
+        self._remote_cache_timer = QTimer(self)
+        self._remote_cache_timer.setSingleShot(True)
+        self._remote_cache_timer.timeout.connect(self._settle_remote_cache)
         self._remote_seek_timer = QTimer(self)
         self._remote_seek_timer.setSingleShot(True)
-        self._remote_seek_timer.setInterval(REMOTE_JOG_INTERVAL_MS)
-        self._remote_seek_timer.timeout.connect(self._flush_remote_seek)
+        self._remote_seek_timer.timeout.connect(self._step_remote_frame)
         self._displayed_time = None
         self.subtitle_entries = []
         self.subtitle_starts = []
@@ -754,6 +788,7 @@ class Player(QMainWindow):
             "view_mode": self.view_mode,
             "pip": False,
             "fullscreen": False,
+            "remote_mode": False,
             "zoom": 1.0,
             "skip_seconds": self.skip_seconds,
             "subtitle_loaded": False,
@@ -829,7 +864,9 @@ class Player(QMainWindow):
         self.audio.setVolume(clamp(self._number_setting("volume", 0.85), 0.0, 1.0))
         self.audio.setMuted(str(self.settings.value("muted", "false")).lower() == "true")
         self.player.setAudioOutput(self.audio)
-        self.player.setVideoOutput(self.video_item)
+        self._playback_sink = QVideoSink(self)
+        self.player.setVideoSink(self._playback_sink)
+        self._playback_sink.videoFrameChanged.connect(self._display_playback_frame)
         if hasattr(self.player, "setPitchCompensation"):
             try:
                 self.player.setPitchCompensation(True)
@@ -868,6 +905,8 @@ class Player(QMainWindow):
         saved_geometry = self.settings.value("window_geometry")
         if saved_geometry is not None:
             self.restoreGeometry(saved_geometry)
+        if sys.platform == "darwin" and coerce_bool(self.settings.value("remote_mode", False)):
+            self._set_replay_remote(True, save_preference=False)
 
     def _open_settings(self):
         settings = QSettings(APP_SETTINGS_ORG, APP_SETTINGS_APP)
@@ -980,10 +1019,11 @@ class Player(QMainWindow):
             self.replay_remote_btn = QPushButton("Remote Mode")
             self.replay_remote_btn.setObjectName("remoteModeButton")
             self.replay_remote_btn.setCheckable(True)
+            self.replay_remote_btn.setFocusPolicy(Qt.FocusPolicy.TabFocus)
             self.replay_remote_btn.setToolTip(
-                "Control playback with the remote while another app has focus"
+                "Control playback with the remote while another app has focus (Return to toggle)"
             )
-            self.replay_remote_btn.clicked.connect(self._set_replay_remote)
+            self.replay_remote_btn.toggled.connect(self._set_replay_remote)
             self.replay_remote_btn.installEventFilter(self)
             timeline_row.addWidget(self.replay_remote_btn)
 
@@ -1242,56 +1282,257 @@ class Player(QMainWindow):
 
         menu.exec(self.view.mapToGlobal(position))
 
-    def _set_replay_remote(self, enabled):
-        error = None
-        if enabled and self._replay_hotkeys is None:
+    def _set_replay_remote(self, enabled, *, save_preference=True):
+        if enabled and self._replay_hotkeys is None and self._quick_keys is None:
             try:
-                self._replay_hotkeys = GlobalHotkeys((
-                    (F16, lambda: self._jog_remote(-REMOTE_JOG_STEP_MS)),
-                    (F17, self._toggle_remote_play),
-                    (F18, lambda: self._jog_remote(REMOTE_JOG_STEP_MS)),
-                ))
+                self._quick_keys = QuickKeys(
+                    self._jog_dial_tick, self._toggle_remote_play, self._zoom_remote,
+                    self._pan_remote, self._skip_remote,
+                )
+            except OSError:
+                LOG.warning("Could not listen for Quick Keys", exc_info=True)
+            try:
+                bindings = (
+                    (F16, 0, partial(self._jog_steps, -1)),
+                    (F17, 0, self._toggle_remote_play),
+                    (F18, 0, partial(self._jog_steps, 1)),
+                    (F19, 0, partial(self._zoom_remote, -1)),
+                    (F20, 0, partial(self._zoom_remote, 1)),
+                    (F19, SHIFT, partial(self._skip_remote, -5000)),
+                    (F20, SHIFT, partial(self._skip_remote, 5000)),
+                    (F16, SHIFT_OPTION, partial(self._pan_remote, -1, 0)),
+                    (F17, SHIFT_OPTION, partial(self._pan_remote, 1, 0)),
+                    (F18, SHIFT_OPTION, partial(self._pan_remote, 0, -1)),
+                    (F19, SHIFT_OPTION, partial(self._pan_remote, 0, 1)),
+                )
+                self._replay_hotkeys = GlobalHotkeys(
+                    (key, modifiers, partial(self._remote_shortcut, action))
+                    for key, modifiers, action in bindings
+                )
             except OSError as exc:
-                error = exc
-        elif not enabled and self._replay_hotkeys is not None:
-            self._replay_hotkeys.close()
-            self._replay_hotkeys = None
+                LOG.warning("Could not reserve remote shortcuts: %s", exc)
+                if self._quick_keys is None:
+                    QMessageBox.warning(
+                        self, "Remote Mode",
+                        "Video Player could not open the Quick Keys or reserve its shortcuts.",
+                    )
+        elif not enabled:
+            self._seek_to_cached_frame()
+            if self._quick_keys is not None:
+                self._quick_keys.close()
+                self._quick_keys = None
+            if self._replay_hotkeys is not None:
+                self._replay_hotkeys.close()
+                self._replay_hotkeys = None
             self._cancel_remote_seek()
+            if self._remote_cache is not None:
+                self._remote_cache.clear()
 
         if sys.platform == "darwin":
-            active = self._replay_hotkeys is not None
-            self.replay_remote_btn.setChecked(active)
+            active = self._quick_keys is not None or self._replay_hotkeys is not None
+            with QSignalBlocker(self.replay_remote_btn):
+                self.replay_remote_btn.setChecked(active)
             self.replay_remote_act.setChecked(active)
-        if error:
-            LOG.warning("Could not enable remote mode: %s", error)
-            QMessageBox.warning(
-                self, "Remote Mode",
-                "Video Player could not reserve F16, F17, and F18. "
-                "If another app uses these shortcuts, close it and try again.",
-            )
+            self._update_state(remote_mode=active)
+            if save_preference:
+                self.settings.setValue("remote_mode", enabled)
+            if active:
+                self._prefetch_remote_frames(self._playback_sink.videoFrame())
 
-    def _jog_remote(self, delta_ms):
-        duration = self.player.duration()
-        if not self.player.isSeekable() or duration <= 0:
+    def _remote_shortcut(self, action):
+        # Quick Keys can send both a device report and a driver shortcut.
+        if self._quick_keys is None or not self._quick_keys.connected:
+            action()
+
+    def _jog_dial_tick(self, direction):
+        if not self.player.isSeekable() or not self.player.duration():
             return
-        position = self._remote_seek_target
-        if position is None:
-            position = self.player.position()
-        self._remote_seek_target = clamp(position + delta_ms, 0, duration)
-        if not self._remote_seek_timer.isActive():
-            self._remote_seek_timer.start()
+        self._remote_dial_remainder += direction * REMOTE_FRAMES_PER_QUARTER
+        if abs(self._remote_dial_remainder) < REMOTE_TICKS_PER_QUARTER:
+            if self._remote_cached_position is not None and not self._remote_cache_waiting:
+                self._remote_cache_timer.start(REMOTE_SETTLE_MS)
+            return
+        self._remote_dial_remainder -= direction * REMOTE_TICKS_PER_QUARTER
+        self._jog_steps(direction, use_cache=True)
 
-    def _flush_remote_seek(self):
-        if self._remote_seek_target is not None:
-            self._seek_to(self._remote_seek_target)
+    def _jog_steps(self, steps, *, use_cache=False):
+        if not self.player.isSeekable() or not self.player.duration():
+            return
+        if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
+            self.player.pause()
+        if (
+            use_cache and self._remote_cache is not None
+            and self._remote_frame_seek is None and not self._remote_pending_steps
+        ):
+            sink = self.video_item.videoSink()
+            reference = sink.videoFrame()
+            cached = self._remote_cache.step(reference, steps)
+            if cached is not None:
+                self._remote_cached_position = (cached.startTime() + cached.endTime()) // 2000
+                self._remote_cache_waiting = False
+                sink.setVideoFrame(cached)
+                self._show_position(self._remote_cached_position)
+                self._remote_cache_timer.start(REMOTE_SETTLE_MS)
+                self._prefetch_remote_frames(cached, steps)
+                return
+            self._prefetch_remote_frames(reference, steps)
+        # Accumulate one net movement while Qt decodes a full-quality frame.
+        self._remote_pending_steps += steps
+        if self._remote_cached_position is not None:
+            if not self._remote_cache_waiting:
+                self._settle_remote_cache()
+            return
+        if self._remote_pending_steps and not self._remote_seek_timer.isActive():
+            self._remote_seek_timer.start(0)
+
+    def _prefetch_remote_frames(self, frame, direction=0):
+        if (
+            self._remote_cache is not None
+            and self._quick_keys is not None
+            and self.player.playbackState() != QMediaPlayer.PlaybackState.PlayingState
+            and self._owns_media_source()
+            and len(self.player.videoTracks()) == 1
+        ):
+            self._remote_cache.request(self.current_file, frame, self.player.duration(), direction)
+
+    def _seek_to_cached_frame(self):
+        if self._remote_cached_position is not None:
+            self.player.setPosition(self._remote_cached_position)
+
+    def _settle_remote_cache(self):
+        position = self._remote_cached_position
+        if position is None:
+            return
+        frame = self._playback_sink.videoFrame()
+        target = position * 1000
+        if frame.isValid() and frame.startTime() <= target < frame.endTime():
+            self._release_remote_cache(frame)
+            return
+        if self._remote_cache_waiting:
+            self._release_remote_cache()
+            return
+        self._remote_cache_waiting = True
+        self._remote_cache_timer.start(REMOTE_FRAME_TIMEOUT_MS)
+        self.player.setPosition(position)
+
+    def _release_remote_cache(self, frame=None):
+        self._remote_cache_timer.stop()
+        self._remote_cached_position = None
+        self._remote_cache_waiting = False
+        self._show_position(self.player.position())
+        if frame is not None:
+            self.video_item.videoSink().setVideoFrame(frame)
+        if self._remote_pending_steps:
+            self._remote_seek_timer.start(0)
+
+    def _display_playback_frame(self, frame):
+        if self._remote_cached_position is not None:
+            target = self._remote_cached_position * 1000
+            if self._remote_cache_waiting and frame.isValid() and frame.startTime() <= target < frame.endTime():
+                self._release_remote_cache(frame)
+            return
+        self.video_item.videoSink().setVideoFrame(frame)
+        self._remote_frame_changed(frame)
+        if self._remote_frame_seek is None:
+            self._prefetch_remote_frames(frame)
+
+    def _step_remote_frame(self):
+        if self._remote_frame_seek is not None:
+            # The previous seek timed out. Apply any new input to the frame Qt has.
+            self._remote_frame_seek = None
+        steps, self._remote_pending_steps = self._remote_pending_steps, 0
+        if not steps:
+            return
+        direction = 1 if steps > 0 else -1
+        frame = self.video_item.videoSink().videoFrame()
+        start, end = frame.startTime(), frame.endTime()
+        if not frame.isValid() or start < 0 or end <= start:
+            self._cancel_remote_seek()
+            return
+        # Seek across the displayed frame's boundary. Qt can select the
+        # preceding frame when a millisecond seek lands exactly on a boundary.
+        target = end // 1000 + 1 if direction > 0 else (start - 1) // 1000
+        duration = self.player.duration()
+        span = end - start
+        if abs(steps) > 1:
+            midpoint = (start + steps * span + span / 2) / 1000
+            target = clamp(round(midpoint), 0, duration - 1)
+            if start <= target * 1000 < end:
+                return
+        if not 0 <= target < duration:
+            self._cancel_remote_seek()
+            return
+        seek = RemoteFrameSeek(start, direction, target, max(1, span // 1000))
+        self._remote_frame_seek = seek
+        self._remote_seek_timer.start(REMOTE_FRAME_TIMEOUT_MS)
+        self._seek_for_remote_frame(seek, target)
+
+    def _seek_for_remote_frame(self, seek, target):
+        if self._remote_frame_seek is seek:
+            seek.target = target
+            self.player.setPosition(target)
+
+    def _remote_frame_changed(self, frame):
+        seek = self._remote_frame_seek
+        if seek is None or not frame.isValid() or frame.startTime() < 0:
+            return
+        difference = frame.startTime() - seek.origin
+        if seek.direction > 0 and difference <= 0 or seek.direction < 0 and difference > 0:
+            return
+        if seek.direction < 0 and (difference == 0 or seek.upper is not None):
+            target = self._previous_frame_probe(seek, difference < 0)
+            if target is not None:
+                QTimer.singleShot(0, lambda: self._seek_for_remote_frame(seek, target))
+                return
+            if difference == 0:
+                self._cancel_remote_seek()
+                return
+        self._remote_frame_seek = None
+        self._remote_seek_timer.stop()
+        if self._remote_pending_steps:
+            self._remote_seek_timer.start(0)
+
+    def _previous_frame_probe(self, seek, shows_earlier_frame):
+        # A variable-rate video can leave a gap before the displayed frame.
+        # Find and refine the last millisecond that displays an earlier frame.
+        if shows_earlier_frame:
+            seek.lower = seek.target
+        else:
+            seek.upper = seek.target
+        if seek.lower is None:
+            if seek.target == 0:
+                return None
+            target = max(0, seek.target - seek.stride)
+            seek.stride *= 2
+            return target
+        if seek.upper - seek.lower > 1:
+            return (seek.lower + seek.upper) // 2
+        return None if shows_earlier_frame else seek.lower
 
     def _cancel_remote_seek(self):
         self._remote_seek_timer.stop()
-        self._remote_seek_target = None
+        self._remote_pending_steps = 0
+        self._remote_frame_seek = None
+        self._remote_dial_remainder = 0
+        self._remote_cache_timer.stop()
+        self._remote_cached_position = None
+        self._remote_cache_waiting = False
 
     def _toggle_remote_play(self):
-        self._flush_remote_seek()
         self.toggle_play()
+
+    def _skip_remote(self, milliseconds):
+        self.skip(milliseconds, show_osd=True)
+
+    def _zoom_remote(self, direction):
+        self.zoom_by(1.15 if direction > 0 else 1 / 1.15, show_osd=True)
+
+    def _pan_remote(self, dx, dy):
+        viewport = self.view.viewport()
+        self.view.pan_by(
+            round(dx * viewport.width() * REMOTE_PAN_VIEWPORT_FRACTION),
+            round(dy * viewport.height() * REMOTE_PAN_VIEWPORT_FRACTION),
+        )
 
     def _build_shortcuts(self):
         context = Qt.ShortcutContext.ApplicationShortcut
@@ -1350,6 +1591,8 @@ class Player(QMainWindow):
             self._save_position()
 
         self._cancel_remote_seek()
+        if self._remote_cache is not None:
+            self._remote_cache.clear()
         self.current_file = path
         self._resume_pending = True
         self._displayed_time = None
@@ -1384,6 +1627,7 @@ class Player(QMainWindow):
     def _handle_control(self, action, arg):
         try:
             if action == "play":
+                self._seek_to_cached_frame()
                 self.player.play()
             elif action == "pause":
                 self.player.pause()
@@ -1431,6 +1675,8 @@ class Player(QMainWindow):
             LOG.exception("Control action %r failed", action)
 
     def toggle_play(self):
+        self._seek_to_cached_frame()
+        self._cancel_remote_seek()
         if self.player.playbackState() == QMediaPlayer.PlaybackState.PlayingState:
             self.player.pause()
         else:
@@ -1438,7 +1684,10 @@ class Player(QMainWindow):
 
     def skip(self, ms, *, show_osd=False):
         duration = self.player.duration()
-        new_position = max(0, min(duration, self.player.position() + ms))
+        position = self._remote_cached_position
+        if position is None:
+            position = self.player.position()
+        new_position = clamp(position + ms, 0, duration)
         self._seek_to(new_position)
 
         if show_osd:
@@ -1816,8 +2065,11 @@ class Player(QMainWindow):
             self._clear_resume_position(self.current_file)
 
     def _on_position(self, position):
-        if self._changing_source:
+        if self._changing_source or self._remote_cached_position is not None:
             return
+        self._show_position(position)
+
+    def _show_position(self, position):
         if not self.slider.isSliderDown():
             self.slider.setValue(position)
         self._update_time(position, self.player.duration())
@@ -1846,10 +2098,13 @@ class Player(QMainWindow):
         self.play_btn.setIcon(icon)
         self._update_state(playing=playing)
         if playing:
+            self._cancel_remote_seek()
             self._on_pointer_activity()
         else:
             self._save_position()
             self._set_overlay_visible(True)
+            if state == QMediaPlayer.PlaybackState.PausedState:
+                self._prefetch_remote_frames(self._playback_sink.videoFrame())
 
     def _on_media_status_changed(self, status):
         if status == QMediaPlayer.MediaStatus.EndOfMedia and self._owns_media_source():
@@ -1892,7 +2147,9 @@ class Player(QMainWindow):
     def _save_position(self):
         if self._resume_pending or not self._owns_media_source():
             return
-        position = self.player.position()
+        position = self._remote_cached_position
+        if position is None:
+            position = self.player.position()
         duration = self.player.duration()
         if duration <= 0:
             return
@@ -2037,8 +2294,20 @@ class Player(QMainWindow):
         self.show_osd("Could not play file")
 
     def eventFilter(self, obj, event):
-        if event.type() in (QEvent.Type.MouseMove, QEvent.Type.Enter):
+        kind = event.type()
+        if kind in (QEvent.Type.MouseMove, QEvent.Type.Enter):
             self._on_pointer_activity()
+        elif kind in (QEvent.Type.ShortcutOverride, QEvent.Type.KeyPress):
+            if obj is getattr(self, "replay_remote_btn", None):
+                key = event.key()
+                if key in (Qt.Key.Key_Space, Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                    if kind == QEvent.Type.KeyPress and not event.isAutoRepeat():
+                        if key == Qt.Key.Key_Space:
+                            self.toggle_play()
+                        else:
+                            self.replay_remote_btn.click()
+                    event.accept()
+                    return True
         return super().eventFilter(obj, event)
 
     def resizeEvent(self, event):
@@ -2092,7 +2361,7 @@ class Player(QMainWindow):
 
     def closeEvent(self, event):
         LOG.info("Closing %s", APP_NAME)
-        self._set_replay_remote(False)
+        self._set_replay_remote(False, save_preference=False)
         self._save_position()
         self.settings.setValue("window_geometry", self.saveGeometry())
         self.settings.setValue("volume", self.audio.volume())
