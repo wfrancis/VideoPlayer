@@ -7,7 +7,7 @@ from time import monotonic
 
 from PyQt6.QtCore import QTimer
 
-from quick_keys_profile import replay_reports
+from quick_keys_profile import driver_uses_replay, replay_reports
 
 
 LOG = logging.getLogger("video_player")
@@ -65,6 +65,7 @@ class QuickKeys:
         self._reported = ReportCallback(self._handle_report)
         self._manager = None
         self._scheduled = False
+        self._open_options = 0 if driver_uses_replay() else SEIZE_DEVICE
 
         self._cf = cf = ct.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
         self._hid = hid = ct.CDLL("/System/Library/Frameworks/IOKit.framework/IOKit")
@@ -114,9 +115,10 @@ class QuickKeys:
             hid.IOHIDManagerRegisterInputReportCallback(self._manager, self._reported, None)
             hid.IOHIDManagerScheduleWithRunLoop(self._manager, self._run_loop, self._mode)
             self._scheduled = True
-            # Claim only the matched vendor interface so the manufacturer's
-            # driver cannot also send its shortcuts to the foreground app.
-            status = hid.IOHIDManagerOpen(self._manager, SEIZE_DEVICE)
+            # Share a compatible Replay profile with Xencelabs Settings.
+            # Conflicting profiles need exclusive access to prevent their
+            # shortcuts from affecting the foreground stats application.
+            status = hid.IOHIDManagerOpen(self._manager, self._open_options)
             if status:
                 raise OSError(f"Could not open Quick Keys HID manager (0x{status & 0xffffffff:08x})")
         except Exception:
@@ -219,7 +221,7 @@ class QuickKeys:
             if self._scheduled:
                 self._hid.IOHIDManagerUnscheduleFromRunLoop(manager, self._run_loop, self._mode)
                 self._scheduled = False
-            self._hid.IOHIDManagerClose(manager, SEIZE_DEVICE)
+            self._hid.IOHIDManagerClose(manager, self._open_options)
             self._cf.CFRelease(manager)
         self._devices.clear()
         self._held_buttons.clear()
