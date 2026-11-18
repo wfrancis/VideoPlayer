@@ -202,7 +202,7 @@ The app includes the decoder for smooth full-resolution scrubbing and automatica
 sets up the remote buttons and screen labels. Remote Mode starts enabled on a new Mac.
 
 Dial center: Play/Pause
-Dial rotation: 18 frames per quarter turn
+Dial rotation: 24 frames per quarter turn
 Rows from the dial down, left / right:
 -5s / +5s
 Zoom Out / Zoom In

@@ -177,7 +177,7 @@ Click **Remote Mode** next to the playback controls to use Quick Keys while ente
 
 The packaged app includes the video decoder and Quick Keys setup. Drag Video Player into Applications, open it, and connect Quick Keys by USB cable or its paired wireless receiver. Remote Mode starts enabled on a new installation, and the app applies the screen labels and dial settings automatically.
 
-A quarter turn moves 18 frames in the direction you turn. Press the center of the dial to play or pause. The bundled decoder preloads nearby frames at source resolution for smoother scrubbing, including when zoomed in. The player combines steps if the target frames are still decoding.
+A quarter turn moves 24 frames in the direction you turn. Press the center of the dial to play or pause. The bundled decoder preloads nearby frames at source resolution for smoother scrubbing, including when zoomed in. The player combines steps if the target frames are still decoding.
 
 With the dial at the top, the controls are arranged in four rows.
 
